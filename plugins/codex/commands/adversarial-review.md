@@ -44,6 +44,9 @@ Argument handling:
 - It does not support `--scope staged` or `--scope unstaged`.
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
 
+Shell quoting:
+- `$ARGUMENTS` is pasted inside double quotes, where the shell still expands `$`, backticks and `\`. Before running either flow, escape every `$`, backtick, `"` and `\` in the arguments with a backslash so the focus text reaches Codex literally (never let it run a command).
+
 Foreground flow:
 - Run:
 ```bash
@@ -64,3 +67,5 @@ Bash({
 ```
 - Do not call `BashOutput` or wait for completion in this turn.
 - After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress."
+
+<!-- Fork modification (Apache-2.0 §4(b)): shell-quoting rule for the arguments. -->

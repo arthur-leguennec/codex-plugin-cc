@@ -1,7 +1,9 @@
+// Fork modification (Apache-2.0 §4(b)): dead-job reconciliation, `status --all` across sessions.
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { isProcessAlive } from "./process.mjs";
+import { getConfig, listJobs as listStoredJobs, readJobFile, resolveJobFile, updateState, writeJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -10,6 +12,64 @@ export const DEFAULT_MAX_PROGRESS_LINES = 4;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+}
+
+const DEAD_JOB_MESSAGE = "The Codex companion process for this job exited without recording a result.";
+
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+/**
+ * Lists jobs, first marking as failed every active job whose process is gone (crashed or
+ * killed worker, reboot). Otherwise such jobs stay "running" forever, block --resume-last
+ * and keep a stale pid that a later cancel would signal.
+ */
+export function listJobs(workspaceRoot, options = {}) {
+  const alive = options.isProcessAlive ?? isProcessAlive;
+  const jobs = listStoredJobs(workspaceRoot);
+  const dead = jobs.filter((job) => isActiveStatus(job.status) && Number.isFinite(job.pid) && !alive(job.pid));
+  if (dead.length === 0) {
+    return jobs;
+  }
+
+  const completedAt = new Date().toISOString();
+  const deadIds = new Set();
+  const nextState = updateState(workspaceRoot, (state) => {
+    for (const job of state.jobs) {
+      // Re-check under the lock: the job may have finished meanwhile.
+      if (dead.some((candidate) => candidate.id === job.id && candidate.pid === job.pid) && isActiveStatus(job.status)) {
+        deadIds.add(job.id);
+        Object.assign(job, {
+          status: "failed",
+          phase: "failed",
+          pid: null,
+          errorMessage: DEAD_JOB_MESSAGE,
+          completedAt,
+          updatedAt: completedAt
+        });
+      }
+    }
+  });
+  for (const jobId of deadIds) {
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    try {
+      const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : { id: jobId };
+      if (isActiveStatus(stored.status ?? "running")) {
+        writeJobFile(workspaceRoot, jobId, {
+          ...stored,
+          status: "failed",
+          phase: "failed",
+          pid: null,
+          errorMessage: DEAD_JOB_MESSAGE,
+          completedAt
+        });
+      }
+    } catch {
+      // A missing or unreadable job file only loses the detail view.
+    }
+  }
+  return nextState.jobs;
 }
 
 function getCurrentSessionId(options = {}) {
@@ -213,7 +273,9 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  // --all lists the jobs of every Claude session, not only the current one.
+  const listed = listJobs(workspaceRoot);
+  const jobs = sortJobsNewestFirst(options.all ? listed : filterJobsForCurrentSession(listed, options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 

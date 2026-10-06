@@ -1,25 +1,29 @@
 #!/usr/bin/env node
+// Fork modification (Apache-2.0 §4(b)): prompt on stdin, timeout below the hook timeout,
+// dead-job reconciliation.
 
-import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { readStdinSync } from "./lib/fs.mjs";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
-import { sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { getConfig } from "./lib/state.mjs";
+import { listJobs, sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Must stay below the Stop hook timeout in hooks/hooks.json (900 s): Claude Code kills the
+// hook first otherwise, orphaning the review task.
+const STOP_REVIEW_TIMEOUT_MS = 14 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
+  const raw = readStdinSync().trim();
   if (!raw) {
     return {};
   }
@@ -102,9 +106,12 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  // The prompt embeds Claude's last message: pass it on stdin, a single argv element is
+  // limited to 128 KiB on Linux (E2BIG).
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json"], {
     cwd,
     env: childEnv,
+    input: prompt,
     encoding: "utf8",
     timeout: STOP_REVIEW_TIMEOUT_MS
   });
@@ -113,7 +120,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+        "The stop-time Codex review task timed out after 14 minutes. Run /codex:review --wait manually or bypass the gate."
     };
   }
 

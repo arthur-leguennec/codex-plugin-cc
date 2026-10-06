@@ -1,3 +1,5 @@
+// Fork modification (Apache-2.0 §4(b)): signal kills are failures, non-leader pids are signalled,
+// process liveness check.
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
@@ -16,7 +18,8 @@ export function runCommand(command, args = [], options = {}) {
   return {
     command,
     args,
-    status: result.status ?? 0,
+    // A command killed by a signal (or a timeout) has no exit status: it did not succeed.
+    status: result.status ?? (result.signal || result.error ? 1 : 0),
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
@@ -100,20 +103,31 @@ export function terminateProcessTree(pid, options = {}) {
   try {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+  } catch {
+    // ESRCH here only means `pid` leads no process group (e.g. a foreground job or a
+    // child spawned without `detached`): signal the process itself.
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
       }
+      throw innerError;
     }
+  }
+}
 
-    return { attempted: true, delivered: false, method: "process-group" };
+/** True when a process with this pid exists (EPERM means it exists but is not ours). */
+export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
   }
 }
 

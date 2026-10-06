@@ -8,7 +8,7 @@ description: Run, monitor and continue Codex jobs (task, review, adversarial-rev
 # Codex Companion CLI (for agents)
 
 `codex-companion` is on the PATH of the Bash tool while this plugin is enabled. Do not look for `${CLAUDE_PLUGIN_ROOT}`.
-If `command -v codex-companion` finds nothing, run `ls ~/.claude/plugins/cache/*/codex/*/bin/codex-companion` and call that file directly.
+If `command -v codex-companion` finds nothing, run `ls -t "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/*/codex/*/bin/codex-companion | head -1` and call that file directly (the newest installed version).
 
 Every command below accepts `--json` for machine-readable output. Run them from the directory you work in
 (your repo or your git worktree): jobs from all worktrees of one repository share the same job list.
@@ -57,7 +57,9 @@ or only active job; pass the id explicitly when several jobs run in parallel.
 
 ## Continue a specific thread
 
-Every job exposes its Codex `threadId` in `status --json`, `result --json` and the output of `task --json`.
+Every job exposes its Codex `threadId` in `status <job-id> --json` and `result --json`, and foreground `task --json`
+prints it too. A `--background` launch only returns the job id: read the `threadId` from `status <job-id> --json`
+once the job is running.
 When several jobs run in parallel, continue YOUR thread by id; `--resume-last` may pick someone else's:
 
 ```bash
@@ -65,8 +67,9 @@ codex-companion task --resume-thread <thread-id> "Now also handle the empty-inpu
 codex-companion task --resume-thread <thread-id> --write --background "Apply the fix you proposed"
 ```
 
-`--resume-thread` cannot be combined with `--resume-last` or `--fresh`. `--resume-last` continues the most recent
-task thread of this Claude session in this repository and refuses while a task of this session is still running.
+`--resume-thread` cannot be combined with `--resume-last` or `--fresh`, and needs a non-empty id. `--resume-last`
+continues the most recent task thread of this Claude session started from this checkout (worktree), and refuses while
+such a task is still running.
 Reviews keep their own threads too (named `Codex Companion [Adversarial ]Review: <target>`).
 
 ## Resume or join a session in the Codex terminal UI
