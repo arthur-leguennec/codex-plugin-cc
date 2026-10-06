@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Fork modification (Apache-2.0 §4(b)): persistent review threads, task --resume-thread.
+// Fork modification (Apache-2.0 §4(b)): persistent review threads, task --resume-thread, job robustness
+// (dead-job reconciliation, cancel races, worker signals).
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -31,14 +32,15 @@ import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
-  listJobs,
   setConfig,
+  updateState,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  listJobs,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -305,6 +307,11 @@ function filterJobsForCurrentClaudeSession(jobs) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
+// State is shared by all worktrees: only continue threads started from this checkout.
+function filterJobsForWorkspace(jobs, workspaceRoot) {
+  return jobs.filter((job) => !job.workspaceRoot || job.workspaceRoot === workspaceRoot);
+}
+
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
@@ -318,7 +325,8 @@ function findLatestResumableTaskJob(jobs) {
 }
 
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  const requestedTimeoutMs = options.timeoutMs == null || options.timeoutMs === "" ? NaN : Number(options.timeoutMs);
+  const timeoutMs = Math.max(0, Number.isFinite(requestedTimeoutMs) ? requestedTimeoutMs : DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
   let snapshot = buildSingleJobSnapshot(cwd, reference);
@@ -338,7 +346,9 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = filterJobsForWorkspace(sortJobsNewestFirst(listJobs(workspaceRoot)), workspaceRoot).filter(
+    (job) => job.id !== options.excludeJobId
+  );
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -663,11 +673,40 @@ function requireTaskRequest(prompt, resumeLast) {
   }
 }
 
+// A killed companion must not leave its job "running" forever: record the termination
+// (unless the job already reached a final state, e.g. cancel wrote "cancelled").
+function installTerminationHandlers(workspaceRoot, jobId, logFile) {
+  const onSignal = (signal) => {
+    try {
+      const stored = readStoredJob(workspaceRoot, jobId);
+      if (stored && (stored.status === "queued" || stored.status === "running")) {
+        const completedAt = nowIso();
+        const errorMessage = `Terminated by ${signal}.`;
+        writeJobFile(workspaceRoot, jobId, { ...stored, status: "failed", phase: "failed", pid: null, errorMessage, completedAt });
+        // Patch only: SessionEnd may have dropped the job from the index while killing us.
+        updateState(workspaceRoot, (state) => {
+          const indexed = state.jobs.find((job) => job.id === jobId);
+          if (indexed && (indexed.status === "queued" || indexed.status === "running")) {
+            Object.assign(indexed, { status: "failed", phase: "failed", pid: null, errorMessage, completedAt, updatedAt: completedAt });
+          }
+        });
+        appendLogLine(logFile, errorMessage);
+      }
+    } finally {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }
+  };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
+  process.once("SIGHUP", onSignal);
+}
+
 async function runForegroundCommand(job, runner, options = {}) {
   const { logFile, progress } = createTrackedProgress(job, {
     logFile: options.logFile,
     stderr: !options.json
   });
+  installTerminationHandlers(job.workspaceRoot, job.id, logFile);
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
@@ -693,17 +732,28 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Record the job before spawning: the worker reads it on startup.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid) {
+    // Only fill in the pid while the worker has not recorded itself yet (it may already run).
+    updateState(job.workspaceRoot, (state) => {
+      const indexed = state.jobs.find((candidate) => candidate.id === job.id);
+      if (indexed && indexed.status === "queued" && indexed.pid == null) {
+        indexed.pid = child.pid;
+      }
+    });
+  }
 
   return {
     payload: {
@@ -782,7 +832,10 @@ async function handleTask(argv) {
   const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
-  const resumeThreadId = options["resume-thread"] ? String(options["resume-thread"]).trim() : null;
+  const resumeThreadId = options["resume-thread"] === undefined ? null : String(options["resume-thread"]).trim();
+  if (resumeThreadId === "") {
+    throw new Error("--resume-thread needs a Codex thread id.");
+  }
   const resumeLast = Boolean(options["resume-last"] || options.resume || resumeThreadId);
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
@@ -880,6 +933,7 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
+  installTerminationHandlers(workspaceRoot, storedJob.id, logFile);
   await runTrackedJob(
     {
       ...storedJob,
@@ -949,7 +1003,9 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(
+    filterJobsForWorkspace(sortJobsNewestFirst(listJobs(workspaceRoot)), workspaceRoot)
+  );
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -988,7 +1044,11 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await interruptAppServerTurn(cwd, {
+    threadId,
+    turnId,
+    transport: existing.appServerTransport ?? job.appServerTransport ?? null
+  });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -999,6 +1059,22 @@ async function handleCancel(argv) {
   }
 
   terminateProcessTree(job.pid ?? Number.NaN);
+
+  // The interrupt can let the job finish on its own while we were waiting: never replace a
+  // stored result with a stale snapshot.
+  const latest = readStoredJob(workspaceRoot, job.id) ?? existing;
+  if (latest.status === "completed") {
+    appendLogLine(job.logFile, "Cancel requested, but the job had already completed.");
+    const payload = {
+      jobId: job.id,
+      status: "completed",
+      title: job.title,
+      turnInterruptAttempted: interrupt.attempted,
+      turnInterrupted: interrupt.interrupted
+    };
+    outputCommandResult(payload, `Job ${job.id} had already completed; nothing to cancel.\n`, options.json);
+    return;
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1012,7 +1088,7 @@ async function handleCancel(argv) {
   };
 
   writeJobFile(workspaceRoot, job.id, {
-    ...existing,
+    ...latest,
     ...nextJob,
     cancelledAt: completedAt
   });

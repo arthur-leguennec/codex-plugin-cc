@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-// Fork modification (Apache-2.0 §4(b)): exports the plugin bin/ dir on PATH.
+// Fork modification (Apache-2.0 §4(b)): exports the plugin bin/ dir on PATH; keeps the broker
+// alive while other sessions still run jobs; locked job cleanup.
 
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { readStdinSync } from "./lib/fs.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
@@ -15,7 +17,8 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { listJobs } from "./lib/job-control.mjs";
+import { resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -23,7 +26,7 @@ export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
+  const raw = readStdinSync().trim();
   if (!raw) {
     return {};
   }
@@ -71,8 +74,7 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const removedJobs = listJobs(workspaceRoot).filter((job) => job.sessionId === sessionId);
   if (removedJobs.length === 0) {
     return;
   }
@@ -89,10 +91,24 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  updateState(workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
+}
+
+// Several Claude sessions in the same checkout share one broker: keep it while another
+// session still has a job in flight there.
+function otherSessionsHaveActiveJobs(cwd, sessionId) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  if (!fs.existsSync(resolveStateFile(workspaceRoot))) {
+    return false;
+  }
+  return listJobs(workspaceRoot).some(
+    (job) =>
+      (job.status === "queued" || job.status === "running") &&
+      job.sessionId !== sessionId &&
+      (!job.workspaceRoot || job.workspaceRoot === workspaceRoot)
+  );
 }
 
 function handleSessionStart(input) {
@@ -104,6 +120,12 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  cleanupSessionJobs(cwd, sessionId);
+  if (otherSessionsHaveActiveJobs(cwd, sessionId)) {
+    return;
+  }
+
   const brokerSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
@@ -123,7 +145,6 @@ async function handleSessionEnd(input) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

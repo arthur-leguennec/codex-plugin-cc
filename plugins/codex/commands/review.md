@@ -39,6 +39,9 @@ Argument handling:
 - `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
+Shell quoting:
+- `$ARGUMENTS` is pasted inside double quotes, where the shell still expands `$`, backticks and `\`. Before running either flow, escape every `$`, backtick, `"` and `\` in the arguments with a backslash so the focus text reaches Codex literally (never let it run a command).
+
 Foreground flow:
 - Run:
 ```bash
@@ -59,3 +62,5 @@ Bash({
 ```
 - Do not call `BashOutput` or wait for completion in this turn.
 - After launching the command, tell the user: "Codex review started in the background. Check `/codex:status` for progress."
+
+<!-- Fork modification (Apache-2.0 §4(b)): shell-quoting rule for the arguments. -->

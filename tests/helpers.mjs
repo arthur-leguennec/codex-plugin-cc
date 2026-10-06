@@ -1,3 +1,4 @@
+// Fork modification (Apache-2.0 §4(b)): optional timeout for `run`.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,7 @@ export function run(command, args, options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
+    timeout: options.timeout,
     shell: options.shell ?? (process.platform === "win32" && !path.isAbsolute(command)),
     windowsHide: true
   });

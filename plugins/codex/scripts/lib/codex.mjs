@@ -1,4 +1,5 @@
-// Fork modification (Apache-2.0 §4(b)): persistent review threads, review thread naming, transport in progress events.
+// Fork modification (Apache-2.0 §4(b)): persistent review threads, review thread naming, transport in progress events,
+// interrupts on the transport a job ran on.
 /**
  * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
  * @typedef {import("./app-server-protocol").ReviewTarget} ReviewTarget
@@ -958,7 +959,19 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+// The turn lives on the server that started it: reconnect to that transport rather than
+// the one the current mode would pick (the daemon may have started or stopped since).
+function appServerModeForTransport(transport) {
+  if (transport === "shared") {
+    return "shared";
+  }
+  if (transport === "broker" || transport === "direct") {
+    return "private";
+  }
+  return undefined;
+}
+
+export async function interruptAppServerTurn(cwd, { threadId, turnId, transport = null }) {
   if (!threadId || !turnId) {
     return {
       attempted: false,
@@ -980,7 +993,10 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    client = await CodexAppServerClient.connect(cwd, {
+      reuseExistingBroker: true,
+      appServerMode: appServerModeForTransport(transport)
+    });
     await client.request("turn/interrupt", { threadId, turnId });
     return {
       attempted: true,

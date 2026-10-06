@@ -1,17 +1,17 @@
 {
   "name": "arthur-leguennec-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "arthur-leguennec"
   },
   "metadata": {
     "description": "Fork of the OpenAI Codex plugin for Claude Code: resumable and live Codex sessions, agent-accessible CLI.",
-    "version": "1.0.6-fork.1"
+    "version": "1.0.6-fork.2"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6-fork.1",
+      "version": "1.0.6-fork.2",
       "author": {
         "name": "OpenAI"
       },

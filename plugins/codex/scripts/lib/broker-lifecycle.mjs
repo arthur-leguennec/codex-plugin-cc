@@ -1,3 +1,5 @@
+// Fork modification (Apache-2.0 §4(b)): broker state per checkout (not shared across worktrees),
+// atomic broker.json, locked broker startup.
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -6,7 +8,8 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { terminateProcessTree } from "./process.mjs";
+import { resolveWorkspaceStateDir, withFileLockAsync, writeFileAtomic } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -69,8 +72,10 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   return child;
 }
 
+// The broker runs with the cwd and environment of the checkout that started it, so each
+// worktree keeps its own (job state is shared, the broker is not).
 function resolveBrokerStateFile(cwd) {
-  return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
+  return path.join(resolveWorkspaceStateDir(cwd), BROKER_STATE_FILE);
 }
 
 export function loadBrokerSession(cwd) {
@@ -87,9 +92,7 @@ export function loadBrokerSession(cwd) {
 }
 
 export function saveBrokerSession(cwd, session) {
-  const stateDir = resolveStateDir(cwd);
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`);
 }
 
 export function clearBrokerSession(cwd) {
@@ -110,7 +113,21 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+function pidFileMatches(pidFile, pid) {
+  try {
+    return Boolean(pidFile) && Number.isFinite(pid) && Number(fs.readFileSync(pidFile, "utf8").trim()) === pid;
+  } catch {
+    return false;
+  }
+}
+
+// Serialized per checkout: two companions starting at once must not each spawn a broker
+// (the unrecorded one would never be shut down).
 export async function ensureBrokerSession(cwd, options = {}) {
+  return withFileLockAsync(resolveBrokerStateFile(cwd), () => ensureBrokerSessionLocked(cwd, options));
+}
+
+async function ensureBrokerSessionLocked(cwd, options) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
@@ -123,7 +140,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
+      // Alive but unreachable (e.g. its socket was cleaned up): still kill it, but only while
+      // its pid file vouches for the pid (after a reboot the pid may belong to anything).
+      killProcess: options.killProcess ?? (pidFileMatches(existing.pidFile, existing.pid) ? terminateProcessTree : null)
     });
     clearBrokerSession(cwd);
   }

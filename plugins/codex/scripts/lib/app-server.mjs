@@ -1,4 +1,5 @@
-// Fork modification (Apache-2.0 §4(b)): optional shared app-server transport (WebSocket over `codex app-server proxy`).
+// Fork modification (Apache-2.0 §4(b)): optional shared app-server transport (WebSocket over `codex app-server proxy`),
+// requests fail fast once the connection has exited.
 /**
  * @typedef {Error & { data?: unknown, rpcCode?: number }} ProtocolError
  * @typedef {import("./app-server-protocol").AppServerMethod} AppServerMethod
@@ -25,6 +26,10 @@ export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 export const APP_SERVER_MODE_ENV = "CODEX_COMPANION_APP_SERVER_MODE";
 export const APP_SERVER_MODES = ["private", "shared", "auto"];
+const DAEMON_PROBE_TIMEOUT_MS = 5000;
+const DAEMON_START_TIMEOUT_MS = 20000;
+const SHARED_CONNECT_TIMEOUT_MS = 10000;
+const SHARED_CONNECT_ATTEMPTS = 3;
 
 /**
  * private (default): one app-server per workspace, as in upstream.
@@ -36,11 +41,11 @@ export function resolveAppServerMode(env = process.env) {
   return APP_SERVER_MODES.includes(raw) ? raw : "private";
 }
 
-function runDaemonCommand(subcommand, env) {
+function runDaemonCommand(subcommand, env, timeout) {
   const result = spawnSync("codex", ["app-server", "daemon", subcommand], {
     env: env ?? process.env,
     encoding: "utf8",
-    timeout: 20000,
+    timeout,
     windowsHide: true,
     shell: process.platform === "win32" ? (process.env.SHELL || true) : false
   });
@@ -54,12 +59,30 @@ function runDaemonCommand(subcommand, env) {
   }
 }
 
+// One probe per process: a companion run connects several times (task, interrupt, auth).
+const daemonProbeCache = new Map();
+
+function daemonProbeKey(env) {
+  const source = env ?? process.env;
+  return `${source.CODEX_HOME ?? ""}\0${source.PATH ?? ""}`;
+}
+
 export function isSharedServerRunning(env) {
-  return runDaemonCommand("version", env)?.status === "running";
+  const key = daemonProbeKey(env);
+  if (!daemonProbeCache.has(key)) {
+    daemonProbeCache.set(key, runDaemonCommand("version", env, DAEMON_PROBE_TIMEOUT_MS)?.status === "running");
+  }
+  return daemonProbeCache.get(key);
 }
 
 export function startSharedServer(env) {
-  return runDaemonCommand("start", env)?.status === "started" || isSharedServerRunning(env);
+  const key = daemonProbeKey(env);
+  daemonProbeCache.delete(key);
+  const started = runDaemonCommand("start", env, DAEMON_START_TIMEOUT_MS)?.status === "started" || isSharedServerRunning(env);
+  if (started) {
+    daemonProbeCache.set(key, true);
+  }
+  return started;
 }
 
 /** @type {ClientInfo} */
@@ -126,6 +149,9 @@ class AppServerClientBase {
   request(method, params) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
+    }
+    if (this.exitResolved) {
+      return Promise.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
 
     const id = this.nextId;
@@ -245,6 +271,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.on("error", (error) => {
       this.handleExit(error);
     });
+    // EPIPE when the app-server exits before a write: surface it as a closed connection.
+    this.proc.stdin.on("error", (error) => {
+      this.handleExit(error);
+    });
 
     this.proc.on("exit", (code, signal) => {
       const stderr = this.stderr.trim();
@@ -339,6 +369,7 @@ class SharedProxyAppServerClient extends AppServerClientBase {
       this.stderr += chunk;
     });
     this.proc.on("error", (error) => this.handleExit(error));
+    this.proc.stdin.on("error", (error) => this.handleExit(error));
     this.proc.on("exit", (code, signal) => {
       const stderr = this.stderr.trim();
       this.handleExit(
@@ -354,11 +385,15 @@ class SharedProxyAppServerClient extends AppServerClientBase {
     this.parser = new FrameParser({
       onMessage: (text) => this.handleLine(text),
       onControl: (opcode, payload) => {
-        if (opcode === 0x9 && !this.closed) {
+        if (opcode === 0x9 && !this.closed && !this.exitResolved) {
           this.proc.stdin.write(encodeFrame(payload, 0xa));
         } else if (opcode === 0x8) {
-          this.handleExit(null);
+          this.handleServerClose(payload);
         }
+      },
+      onError: (error) => {
+        this.handleExit(createProtocolError(`Shared Codex app-server: ${error.message}`));
+        this.close().catch(() => {});
       }
     });
 
@@ -381,7 +416,8 @@ class SharedProxyAppServerClient extends AppServerClientBase {
         return;
       }
       const head = handshakeBuffer.subarray(0, end).toString("utf8");
-      if (!/^HTTP\/1\.1 101/.test(head) || !head.includes(expectedAccept)) {
+      const acceptHeader = /^sec-websocket-accept:\s*(\S+)\s*$/im.exec(head)?.[1] ?? null;
+      if (!/^HTTP\/1\.1 101/.test(head) || acceptHeader !== expectedAccept) {
         rejectHandshake(createProtocolError(`Shared Codex app-server rejected the WebSocket upgrade: ${head.split("\r\n")[0]}`));
         return;
       }
@@ -395,13 +431,55 @@ class SharedProxyAppServerClient extends AppServerClientBase {
     this.exitPromise.then(() => rejectHandshake(this.exitError ?? new Error("codex app-server proxy closed during handshake.")));
 
     this.proc.stdin.write(request);
-    await handshake;
 
-    await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
-      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
+    // A wedged daemon must not hang the caller: bound the handshake and initialize, and
+    // always reap the proxy when connecting fails (it would keep the event loop alive).
+    const timeoutMs = this.options.sharedConnectTimeoutMs ?? SHARED_CONNECT_TIMEOUT_MS;
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(createProtocolError(`Timed out after ${timeoutMs}ms connecting to the shared Codex app-server.`)),
+        timeoutMs
+      );
+      timer.unref?.();
     });
+    try {
+      await Promise.race([
+        (async () => {
+          await handshake;
+          await this.request("initialize", {
+            clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
+            capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
+          });
+        })(),
+        timeout
+      ]);
+    } catch (error) {
+      this.handleExit(error);
+      await this.close().catch(() => {});
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
     this.notify("initialized", {});
+  }
+
+  handleServerClose(payload) {
+    const code = payload.length >= 2 ? payload.readUInt16BE(0) : null;
+    const reason = payload.length > 2 ? payload.subarray(2).toString("utf8") : "";
+    if (!this.closed) {
+      try {
+        this.proc.stdin.write(encodeFrame(payload.subarray(0, Math.min(payload.length, 2)), 0x8));
+      } catch {
+        // The proxy may already be gone.
+      }
+    }
+    this.handleExit(
+      code === 1000 || code === null
+        ? null
+        : createProtocolError(`Shared Codex app-server closed the connection (code ${code}${reason ? `: ${reason}` : ""}).`)
+    );
+    this.close().catch(() => {});
   }
 
   sendMessage(message) {
@@ -419,14 +497,25 @@ class SharedProxyAppServerClient extends AppServerClientBase {
     }
     this.closed = true;
     try {
-      this.proc?.stdin.write(encodeFrame(Buffer.alloc(0), 0x8));
+      if (!this.exitResolved) {
+        this.proc?.stdin.write(encodeFrame(Buffer.alloc(0), 0x8));
+      }
       this.proc?.stdin.end();
     } catch {
       // The proxy may already be gone.
     }
     setTimeout(() => {
       if (this.proc && this.proc.exitCode === null) {
-        this.proc.kill("SIGTERM");
+        // On Windows the direct child is the shell wrapper; kill the whole tree.
+        if (process.platform === "win32") {
+          try {
+            terminateProcessTree(this.proc.pid);
+          } catch {
+            // Best-effort cleanup inside an unref'd timer.
+          }
+        } else {
+          this.proc.kill("SIGTERM");
+        }
       }
     }, 200).unref?.();
     await this.exitPromise;
@@ -497,14 +586,23 @@ export class CodexAppServerClient {
       const env = options.env ?? process.env;
       const available = isSharedServerRunning(env) || (mode === "shared" && startSharedServer(env));
       if (available) {
-        try {
-          const shared = new SharedProxyAppServerClient(cwd, options);
-          await shared.initialize();
-          return shared;
-        } catch (error) {
-          if (mode === "shared") {
-            throw error;
+        // Right after `daemon start` the socket may not be listening yet: retry briefly.
+        const attempts = mode === "shared" ? SHARED_CONNECT_ATTEMPTS : 1;
+        let lastError = null;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+          try {
+            const shared = new SharedProxyAppServerClient(cwd, options);
+            await shared.initialize();
+            return shared;
+          } catch (error) {
+            lastError = error;
+            if (attempt < attempts) {
+              await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+            }
           }
+        }
+        if (mode === "shared") {
+          throw lastError;
         }
       } else if (mode === "shared") {
         throw new Error(

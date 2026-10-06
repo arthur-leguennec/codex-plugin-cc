@@ -298,7 +298,8 @@ This way you can review the Codex work or continue the work there.
 
 This fork keeps the plugin name `codex`, so the `/codex:*` commands are unchanged. It is a drop-in
 replacement for the official plugin: uninstall `codex@openai-codex` first, otherwise hooks (including the
-stop gate) would run twice. Modified files carry a "Fork modification (Apache-2.0 §4(b))" notice.
+stop gate) would run twice. Modified source and Markdown files carry a "Fork modification (Apache-2.0 §4(b))"
+notice; JSON files (manifests, lockfile) cannot hold comments and are listed in `plugins/codex/CHANGELOG.md`.
 
 - **Resumable sessions.** `review` and `adversarial-review` now keep their Codex thread (named
   `Codex Companion [Adversarial ]Review: <target>`), so every session started by the plugin opens with
@@ -321,7 +322,18 @@ stop gate) would run twice. Modified files carry a "Fork modification (Apache-2.
   the resume/join commands. The slash commands are unchanged and remain user-only.
 - **Worktree-wide job list.** Job state is keyed by the repository's git common directory, so jobs started from
   any linked worktree are visible from the main checkout and vice versa; `/codex:status` prints the job's own
-  workspace when it differs.
+  workspace when it differs. Bare repositories with linked worktrees are supported too. The stop-review-gate
+  setting is part of that state, so enabling it in one worktree enables it in all of them. `--resume-last`
+  only continues threads started from the current checkout, and each checkout keeps its own app-server broker.
+- **Robustness fixes.** State updates are locked and atomic (concurrent jobs no longer lose each other's
+  records), jobs whose process died are marked failed, `cancel` no longer overwrites a job that completed
+  meanwhile, a session ending no longer stops a broker other sessions still use, and the shared-mode client
+  times out and cleans up instead of hanging.
+
+**State after switching from the official plugin:** the plugin data directory changes with the marketplace name,
+so jobs and the review-gate setting from `codex@openai-codex` are not carried over (re-run
+`/codex:setup --enable-review-gate` if you used it). Worktree users of an older version of this fork also start
+with an empty job list in linked worktrees.
 
 Install the fork:
 

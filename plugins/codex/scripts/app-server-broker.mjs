@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// Fork modification (Apache-2.0 §4(b)): per-socket serial message handling, exit when the
+// underlying app-server exits.
 
 import fs from "node:fs";
 import net from "node:net";
@@ -99,7 +101,13 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
+  let shutdownPromise = null;
+  function shutdown(server) {
+    shutdownPromise ??= closeEverything(server);
+    return shutdownPromise;
+  }
+
+  async function closeEverything(server) {
     for (const socket of sockets) {
       socket.end();
     }
@@ -119,17 +127,25 @@ async function main() {
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
+    // Lines are split synchronously and handled one at a time per socket, so an awaited
+    // request never interleaves with the next chunk of the same connection.
+    let queue = Promise.resolve();
 
-    socket.on("data", async (chunk) => {
+    socket.on("data", (chunk) => {
       buffer += chunk;
-      let newlineIndex = buffer.indexOf("\n");
-      while (newlineIndex !== -1) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        newlineIndex = buffer.indexOf("\n");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        queue = queue.then(() => handleLine(line)).catch((error) => {
+          process.stderr.write(`broker: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
+      }
+    });
 
+    async function handleLine(line) {
+      {
         if (!line.trim()) {
-          continue;
+          return;
         }
 
         let message;
@@ -140,7 +156,7 @@ async function main() {
             id: null,
             error: buildJsonRpcError(-32700, `Invalid JSON: ${error.message}`)
           });
-          continue;
+          return;
         }
 
         if (message.id !== undefined && message.method === "initialize") {
@@ -150,11 +166,11 @@ async function main() {
               userAgent: "codex-companion-broker"
             }
           });
-          continue;
+          return;
         }
 
         if (message.method === "initialized" && message.id === undefined) {
-          continue;
+          return;
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
@@ -164,7 +180,7 @@ async function main() {
         }
 
         if (message.id === undefined) {
-          continue;
+          return;
         }
 
         const allowInterruptDuringActiveStream =
@@ -178,7 +194,7 @@ async function main() {
             id: message.id,
             error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
           });
-          continue;
+          return;
         }
 
         if (allowInterruptDuringActiveStream) {
@@ -191,7 +207,7 @@ async function main() {
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
           }
-          continue;
+          return;
         }
 
         const isStreaming = STREAMING_METHODS.has(message.method);
@@ -220,7 +236,7 @@ async function main() {
           }
         }
       }
-    });
+    }
 
     socket.on("close", () => {
       sockets.delete(socket);
@@ -241,6 +257,17 @@ async function main() {
   process.on("SIGINT", async () => {
     await shutdown(server);
     process.exit(0);
+  });
+
+  // Without its app-server the broker can only hang its clients: shut down so the next
+  // companion call starts a fresh one.
+  appClient.exitPromise.then(async () => {
+    if (shutdownPromise) {
+      return;
+    }
+    process.stderr.write(`broker: codex app-server exited${appClient.exitError ? `: ${appClient.exitError.message}` : "."}\n`);
+    await shutdown(server).catch(() => {});
+    process.exit(1);
   });
 
   server.listen(listenTarget.path);

@@ -1,3 +1,4 @@
+// Fork modification (Apache-2.0 §4(b)): fake `codex app-server daemon` and WebSocket `app-server proxy`.
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -119,6 +120,11 @@ function sendFrame(text) {
   let header;
   if (data.length < 126) {
     header = Buffer.from([0x81, data.length]);
+  } else if (data.length >= 65536) {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(data.length), 2);
   } else {
     header = Buffer.alloc(4);
     header[0] = 0x81;
@@ -313,11 +319,19 @@ if (PROXY_MODE) {
   rlInput = new PassThrough();
   let buf = Buffer.alloc(0);
   let upgraded = false;
+  // FAKE_CODEX_PROXY: unset (normal) | "reject" (HTTP 400, stays alive) | "silent" (never answers).
+  const proxyBehavior = process.env.FAKE_CODEX_PROXY || "";
   process.stdin.on("data", (chunk) => {
+    if (proxyBehavior === "silent" || upgraded === "rejected") return;
     buf = Buffer.concat([buf, chunk]);
     if (!upgraded) {
       const end = buf.indexOf("\\r\\n\\r\\n");
       if (end === -1) return;
+      if (proxyBehavior === "reject") {
+        process.stdout.write("HTTP/1.1 400 Bad Request\\r\\n\\r\\n");
+        upgraded = "rejected";
+        return;
+      }
       const head = buf.subarray(0, end).toString("utf8");
       const key = /Sec-WebSocket-Key: (.+)/i.exec(head)[1].trim();
       const accept = crypto2.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
@@ -331,6 +345,7 @@ if (PROXY_MODE) {
       let len = buf[1] & 0x7f;
       let off = 2;
       if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
       if (buf.length < off + 4 + len) return;
       const mask = buf.subarray(off, off + 4);
       const payload = Buffer.from(buf.subarray(off + 4, off + 4 + len));
