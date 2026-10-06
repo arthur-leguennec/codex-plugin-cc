@@ -1,7 +1,10 @@
+// Fork modification (Apache-2.0 §4(b)): state directory shared by all git worktrees of a repository.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+import { spawnSync } from "node:child_process";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -26,8 +29,28 @@ function defaultState() {
   };
 }
 
-export function resolveStateDir(cwd) {
+// All linked worktrees of a repository share the state of its main checkout,
+// so jobs started from a worktree show up everywhere (and vice versa).
+// Falls back to the plain workspace root outside git or for bare repositories.
+export function resolveStateRoot(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const result = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    cwd: workspaceRoot,
+    encoding: "utf8",
+    windowsHide: true
+  });
+  if (result.error || result.status !== 0) {
+    return workspaceRoot;
+  }
+  const commonDir = result.stdout.trim();
+  if (commonDir && path.basename(commonDir) === ".git") {
+    return path.dirname(commonDir);
+  }
+  return workspaceRoot;
+}
+
+export function resolveStateDir(cwd) {
+  const workspaceRoot = resolveStateRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
     canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);
