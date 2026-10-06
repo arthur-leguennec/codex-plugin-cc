@@ -145,6 +145,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);
   }
+  if (job.workspaceRoot && (options.showWorkspace || (options.currentWorkspaceRoot && job.workspaceRoot !== options.currentWorkspaceRoot))) {
+    lines.push(`  Workspace: ${job.workspaceRoot}`);
+  }
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
   }
@@ -351,6 +354,7 @@ export function renderStatusReport(report) {
     lines.push("Live details:");
     for (const job of report.running) {
       pushJobDetails(lines, job, {
+        currentWorkspaceRoot: report.workspaceRoot,
         showElapsed: true,
         showLog: true
       });
@@ -361,6 +365,7 @@ export function renderStatusReport(report) {
   if (report.latestFinished) {
     lines.push("Latest finished:");
     pushJobDetails(lines, report.latestFinished, {
+      currentWorkspaceRoot: report.workspaceRoot,
       showDuration: true,
       showLog: report.latestFinished.status === "failed"
     });
@@ -371,6 +376,7 @@ export function renderStatusReport(report) {
     lines.push("Recent jobs:");
     for (const job of report.recent) {
       pushJobDetails(lines, job, {
+        currentWorkspaceRoot: report.workspaceRoot,
         showDuration: true,
         showLog: job.status === "failed"
       });
@@ -394,6 +400,7 @@ export function renderJobStatusReport(job) {
     showElapsed: job.status === "queued" || job.status === "running",
     showDuration: job.status !== "queued" && job.status !== "running",
     showLog: true,
+    showWorkspace: true,
     showCancelHint: true,
     showResultHint: true,
     showReviewHint: true
