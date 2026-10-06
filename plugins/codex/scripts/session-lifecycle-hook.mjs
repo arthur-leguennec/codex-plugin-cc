@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+// Fork modification (Apache-2.0 §4(b)): exports the plugin bin/ dir on PATH.
 
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
@@ -37,6 +39,25 @@ function appendEnvVar(name, value) {
     return;
   }
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+}
+
+// Fallback for hosts that do not put the plugin's bin/ on PATH: expose it through
+// CLAUDE_ENV_FILE, idempotently.
+function appendPluginBinToPath() {
+  const root = process.env.CLAUDE_PLUGIN_ROOT;
+  if (!process.env.CLAUDE_ENV_FILE || !root) {
+    return;
+  }
+  const binDir = path.join(root, "bin");
+  if (!fs.existsSync(binDir)) {
+    return;
+  }
+  const quoted = shellEscape(binDir);
+  fs.appendFileSync(
+    process.env.CLAUDE_ENV_FILE,
+    `case ":$PATH:" in *":"${quoted}":"*) ;; *) export PATH="$PATH":${quoted} ;; esac\n`,
+    "utf8"
+  );
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
@@ -78,6 +99,7 @@ function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  appendPluginBinToPath();
 }
 
 async function handleSessionEnd(input) {

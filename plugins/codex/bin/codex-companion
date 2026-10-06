@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+// Fork addition (Apache-2.0 §4(b)): stable entry point on the PATH of Claude Code's
+// Bash tool (plugin `bin/`), so agents need not know ${CLAUDE_PLUGIN_ROOT}.
+// Written as CommonJS; plugins/codex/package.json pins this directory to commonjs
+// so the extensionless file is not treated as an ES module.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+
+const pluginRoot = path.resolve(fs.realpathSync(__dirname), "..");
+
+// Subagents may not inherit the env vars the SessionStart hook exports. Without
+// CLAUDE_PLUGIN_DATA the job state would land in a different directory than the
+// main session's, so derive the standard data dir from the cache layout:
+//   <claude>/plugins/cache/<marketplace>/<plugin>/<version>  ->  <claude>/plugins/data/<plugin>-<marketplace>
+if (!process.env.CLAUDE_PLUGIN_DATA) {
+  const parts = pluginRoot.split(path.sep);
+  const cacheIndex = parts.lastIndexOf("cache");
+  if (cacheIndex > 0 && parts.length >= cacheIndex + 4 && parts[cacheIndex - 1] === "plugins") {
+    const [marketplace, plugin] = parts.slice(cacheIndex + 1, cacheIndex + 3);
+    const dataDir = path.join(parts.slice(0, cacheIndex).join(path.sep) || path.sep, "data", `${plugin}-${marketplace}`);
+    if (fs.existsSync(dataDir)) {
+      process.env.CLAUDE_PLUGIN_DATA = dataDir;
+    }
+  }
+}
+if (!process.env.CLAUDE_PLUGIN_ROOT) {
+  process.env.CLAUDE_PLUGIN_ROOT = pluginRoot;
+}
+
+import(pathToFileURL(path.join(pluginRoot, "scripts", "codex-companion.mjs")).href).catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
