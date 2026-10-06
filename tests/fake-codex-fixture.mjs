@@ -112,7 +112,27 @@ function buildConfigReadResult() {
   }
 }
 
+const PROXY_MODE = process.argv[2] === "app-server" && process.argv[3] === "proxy";
+
+function sendFrame(text) {
+  const data = Buffer.from(text, "utf8");
+  let header;
+  if (data.length < 126) {
+    header = Buffer.from([0x81, data.length]);
+  } else {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(data.length, 2);
+  }
+  process.stdout.write(Buffer.concat([header, data]));
+}
+
 function send(message) {
+  if (PROXY_MODE) {
+    sendFrame(JSON.stringify(message));
+    return;
+  }
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
@@ -267,14 +287,62 @@ if (args[0] === "login" && args[1] === "status") {
 if (args[0] === "login") {
   process.exit(0);
 }
+if (args[0] === "app-server" && args[1] === "daemon") {
+  // FAKE_CODEX_DAEMON: "running" (default) | "stopped" (cannot be started).
+  if (process.env.FAKE_CODEX_DAEMON === "stopped") {
+    console.error("failed to connect to the app-server control socket");
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ status: args[2] === "start" ? "started" : "running" }));
+  process.exit(0);
+}
 if (args[0] !== "app-server") {
   process.exit(1);
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+if (PROXY_MODE) {
+  bootState.proxyStarts = (bootState.proxyStarts || 0) + 1;
+}
 saveState(bootState);
 
-const rl = readline.createInterface({ input: process.stdin });
+let rlInput = process.stdin;
+if (PROXY_MODE) {
+  const { PassThrough } = require("node:stream");
+  const crypto2 = require("node:crypto");
+  rlInput = new PassThrough();
+  let buf = Buffer.alloc(0);
+  let upgraded = false;
+  process.stdin.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    if (!upgraded) {
+      const end = buf.indexOf("\\r\\n\\r\\n");
+      if (end === -1) return;
+      const head = buf.subarray(0, end).toString("utf8");
+      const key = /Sec-WebSocket-Key: (.+)/i.exec(head)[1].trim();
+      const accept = crypto2.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+      process.stdout.write("HTTP/1.1 101 Switching Protocols\\r\\nconnection: Upgrade\\r\\nupgrade: websocket\\r\\nsec-websocket-accept: " + accept + "\\r\\n\\r\\n");
+      buf = buf.subarray(end + 4);
+      upgraded = true;
+    }
+    for (;;) {
+      if (buf.length < 2) return;
+      const opcode = buf[0] & 0x0f;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      if (buf.length < off + 4 + len) return;
+      const mask = buf.subarray(off, off + 4);
+      const payload = Buffer.from(buf.subarray(off + 4, off + 4 + len));
+      for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+      buf = buf.subarray(off + 4 + len);
+      if (opcode === 0x8) { process.exit(0); }
+      if (opcode === 0x1) rlInput.write(payload.toString("utf8") + "\\n");
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
+}
+const rl = readline.createInterface({ input: rlInput });
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;

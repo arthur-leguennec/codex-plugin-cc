@@ -1,3 +1,4 @@
+// Fork modification (Apache-2.0 §4(b)): renders the live-join command for jobs on the shared app-server.
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -106,6 +107,15 @@ function formatCodexResumeCommand(job) {
   return `codex resume ${job.threadId}`;
 }
 
+// Command to attach the Codex TUI to a thread that lives on the shared
+// app-server, so it can be followed (and steered) while it runs.
+export function formatCodexJoinCommand(job) {
+  if (!job?.threadId || job.appServerTransport !== "shared") {
+    return null;
+  }
+  return `codex resume --remote unix:// ${job.threadId}`;
+}
+
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
   lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
@@ -141,6 +151,10 @@ function pushJobDetails(lines, job, options = {}) {
   const resumeCommand = formatCodexResumeCommand(job);
   if (resumeCommand) {
     lines.push(`  Resume in Codex: ${resumeCommand}`);
+  }
+  const joinCommand = formatCodexJoinCommand(job);
+  if (joinCommand) {
+    lines.push(`  Join live (shared server): ${joinCommand}`);
   }
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
@@ -390,12 +404,14 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  const joinCommand = formatCodexJoinCommand({ threadId, appServerTransport: storedJob?.appServerTransport ?? job.appServerTransport });
+  const joinLine = joinCommand ? `Join live (shared server): ${joinCommand}\n` : "";
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${joinLine}`;
   }
 
   const rawOutput =
@@ -407,7 +423,7 @@ export function renderStoredJobResult(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${joinLine}`;
   }
 
   if (storedJob?.rendered) {
@@ -415,7 +431,7 @@ export function renderStoredJobResult(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${joinLine}`;
   }
 
   const lines = [
@@ -428,6 +444,9 @@ export function renderStoredJobResult(job, storedJob) {
   if (threadId) {
     lines.push(`Codex session ID: ${threadId}`);
     lines.push(`Resume in Codex: ${resumeCommand}`);
+    if (joinCommand) {
+      lines.push(`Join live (shared server): ${joinCommand}`);
+    }
   }
 
   if (job.summary) {
