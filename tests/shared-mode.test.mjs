@@ -8,6 +8,21 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { APP_SERVER_MODE_ENV, resolveAppServerMode } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { formatCodexJoinCommand } from "../plugins/codex/scripts/lib/render.mjs";
+import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+
+const SESSION_HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "codex", "scripts", "session-lifecycle-hook.mjs");
+
+async function waitFor(predicate, { timeoutMs = 15000, intervalMs = 50 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const value = await predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error("Timed out waiting for condition.");
+}
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
@@ -110,4 +125,52 @@ test("forced shared mode fails loudly when the shared server is unavailable", ()
   const result = run("node", [SCRIPT, "task", "--json", "hello"], { cwd: repo, env });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr + result.stdout, new RegExp(APP_SERVER_MODE_ENV));
+});
+
+test("cancel interrupts the running turn of a shared-server job", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = envFor(binDir, { [APP_SERVER_MODE_ENV]: "shared" });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = env.CLAUDE_PLUGIN_DATA;
+  const stateDir = resolveStateDir(repo);
+  if (previousPluginData === undefined) {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+  } else {
+    process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+  }
+  const runningJob = await waitFor(() => {
+    const statePath = path.join(stateDir, "state.json");
+    if (!fs.existsSync(statePath)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(statePath, "utf8")).jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  });
+  assert.equal(runningJob.appServerTransport, "shared");
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  const payload = JSON.parse(cancelled.stdout);
+  assert.equal(payload.status, "cancelled");
+  assert.equal(payload.turnInterruptAttempted, true);
+
+  const lastInterrupt = await waitFor(() => fakeState(binDir).lastInterrupt ?? null);
+  assert.deepEqual(lastInterrupt, { threadId: runningJob.threadId, turnId: runningJob.turnId });
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
 });
