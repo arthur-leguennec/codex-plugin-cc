@@ -1,5 +1,8 @@
 # Codex plugin for Claude Code
 
+> **Fork notice.** This is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
+> (based on upstream v1.0.6, Apache-2.0). See [Fork changes](#fork-changes) for what differs.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
@@ -24,13 +27,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add arthur-leguennec/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@arthur-leguennec-codex
 ```
 
 Reload plugins:
@@ -290,6 +293,45 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
+
+## Fork changes
+
+This fork keeps the plugin name `codex`, so the `/codex:*` commands are unchanged. It is a drop-in
+replacement for the official plugin: uninstall `codex@openai-codex` first, otherwise hooks (including the
+stop gate) would run twice. Modified files carry a "Fork modification (Apache-2.0 §4(b))" notice.
+
+- **Resumable sessions.** `review` and `adversarial-review` now keep their Codex thread (named
+  `Codex Companion [Adversarial ]Review: <target>`), so every session started by the plugin opens with
+  `codex resume <id>`. `task --resume-thread <thread-id>` continues a specific thread, which stays safe when
+  several jobs run in parallel (`--resume-last` still exists).
+- **Live sessions (opt-in).** `CODEX_COMPANION_APP_SERVER_MODE` selects the app-server:
+  - `private` (default): a private `codex app-server` per workspace, as upstream.
+  - `shared`: attach to the shared local Codex app-server (`codex app-server daemon`) through
+    `codex app-server proxy`; starts the daemon if needed and fails if it cannot.
+  - `auto`: use the shared server only if it is already running, otherwise fall back to `private`.
+
+  Jobs on the shared server show `codex resume --remote unix:// <thread-id>` in `/codex:status` and
+  `/codex:result`, which attaches the Codex terminal UI to the running turn. **Caveat:** commands run by Codex
+  on the shared server use the *server's* environment, not the Claude session's: `VIRTUAL_ENV`, `AWS_PROFILE`,
+  venv entries of `PATH` and other variables set in your session are not visible to them (`pwd` is correct).
+  This is why `private` stays the default.
+- **Agents and workflows.** `bin/codex-companion` is on the Bash tool's PATH (with an idempotent SessionStart
+  fallback), and the model-invocable `codex-companion-cli` skill documents `task` (background, `--write`,
+  `--resume-thread`), `review`, `adversarial-review`, `status --json`, `result --json`, `cancel`, and how to get
+  the resume/join commands. The slash commands are unchanged and remain user-only.
+- **Worktree-wide job list.** Job state is keyed by the repository's git common directory, so jobs started from
+  any linked worktree are visible from the main checkout and vice versa; `/codex:status` prints the job's own
+  workspace when it differs.
+
+Install the fork:
+
+```bash
+/plugin marketplace add arthur-leguennec/codex-plugin-cc
+/plugin install codex@arthur-leguennec-codex
+```
+
+Licensed under Apache-2.0 like upstream; `LICENSE` and `NOTICE` are unchanged. To rebase on upstream:
+`git fetch upstream && git rebase upstream/main`.
 
 ## FAQ
 
