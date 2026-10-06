@@ -35,6 +35,7 @@ Forwarding rules:
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
+- `--resume-thread <thread-id>` is a routing control too: strip it from the task text and pass `--resume-thread <thread-id>` through to `task` unchanged (do not also add `--resume-last`).
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
@@ -44,3 +45,5 @@ Forwarding rules:
 Response style:
 
 - Do not add commentary before or after the forwarded `codex-companion` output.
+
+<!-- Fork modification (Apache-2.0 §4(b)): accepts --resume-thread. -->
