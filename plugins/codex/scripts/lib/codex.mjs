@@ -1,4 +1,4 @@
-// Fork modification (Apache-2.0 §4(b)): persistent review threads, review thread naming.
+// Fork modification (Apache-2.0 §4(b)): persistent review threads, review thread naming, transport in progress events.
 /**
  * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
  * @typedef {import("./app-server-protocol").ReviewTarget} ReviewTarget
@@ -1016,7 +1016,8 @@ export async function runAppServerReview(cwd, options = {}) {
     });
     const sourceThreadId = thread.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
-      threadId: sourceThreadId
+      threadId: sourceThreadId,
+      transport: client.transport
     });
     const delivery = options.delivery ?? "inline";
 
@@ -1122,7 +1123,8 @@ export async function runAppServerTurn(cwd, options = {}) {
     }
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
-      threadId
+      threadId,
+      transport: client.transport
     });
 
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";

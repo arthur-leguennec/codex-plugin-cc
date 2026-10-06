@@ -1,3 +1,4 @@
+// Fork modification (Apache-2.0 §4(b)): optional shared app-server transport (WebSocket over `codex app-server proxy`).
 /**
  * @typedef {Error & { data?: unknown, rpcCode?: number }} ProtocolError
  * @typedef {import("./app-server-protocol").AppServerMethod} AppServerMethod
@@ -10,17 +11,56 @@
 import fs from "node:fs";
 import net from "node:net";
 import process from "node:process";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
+import { FrameParser, buildHandshake, encodeFrame } from "./ws-frames.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+export const APP_SERVER_MODE_ENV = "CODEX_COMPANION_APP_SERVER_MODE";
+export const APP_SERVER_MODES = ["private", "shared", "auto"];
+
+/**
+ * private (default): one app-server per workspace, as in upstream.
+ * shared: attach to the shared local app-server daemon (start it if needed).
+ * auto: use the shared daemon only when it is already running, else private.
+ */
+export function resolveAppServerMode(env = process.env) {
+  const raw = String(env?.[APP_SERVER_MODE_ENV] ?? "").trim().toLowerCase();
+  return APP_SERVER_MODES.includes(raw) ? raw : "private";
+}
+
+function runDaemonCommand(subcommand, env) {
+  const result = spawnSync("codex", ["app-server", "daemon", subcommand], {
+    env: env ?? process.env,
+    encoding: "utf8",
+    timeout: 20000,
+    windowsHide: true,
+    shell: process.platform === "win32" ? (process.env.SHELL || true) : false
+  });
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+export function isSharedServerRunning(env) {
+  return runDaemonCommand("version", env)?.status === "running";
+}
+
+export function startSharedServer(env) {
+  return runDaemonCommand("start", env)?.status === "started" || isSharedServerRunning(env);
+}
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -275,6 +315,124 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+/**
+ * Client for the shared local Codex app-server. `codex app-server proxy` relays
+ * stdio bytes to the daemon's control socket, which speaks WebSocket, so this
+ * client performs the WebSocket handshake and framing over the proxy's stdio.
+ */
+class SharedProxyAppServerClient extends AppServerClientBase {
+  constructor(cwd, options = {}) {
+    super(cwd, options);
+    this.transport = "shared";
+  }
+
+  async initialize() {
+    this.proc = spawn("codex", ["app-server", "proxy"], {
+      cwd: this.cwd,
+      env: this.options.env ?? process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+      windowsHide: true
+    });
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", (chunk) => {
+      this.stderr += chunk;
+    });
+    this.proc.on("error", (error) => this.handleExit(error));
+    this.proc.on("exit", (code, signal) => {
+      const stderr = this.stderr.trim();
+      this.handleExit(
+        code === 0 || this.closed
+          ? null
+          : createProtocolError(
+              `codex app-server proxy exited unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).${stderr ? `\n${stderr}` : ""}`
+            )
+      );
+    });
+
+    const { request, expectedAccept } = buildHandshake();
+    this.parser = new FrameParser({
+      onMessage: (text) => this.handleLine(text),
+      onControl: (opcode, payload) => {
+        if (opcode === 0x9 && !this.closed) {
+          this.proc.stdin.write(encodeFrame(payload, 0xa));
+        } else if (opcode === 0x8) {
+          this.handleExit(null);
+        }
+      }
+    });
+
+    let handshakeBuffer = Buffer.alloc(0);
+    let upgraded = false;
+    let resolveHandshake;
+    let rejectHandshake;
+    const handshake = new Promise((resolve, reject) => {
+      resolveHandshake = resolve;
+      rejectHandshake = reject;
+    });
+    this.proc.stdout.on("data", (chunk) => {
+      if (upgraded) {
+        this.parser.push(chunk);
+        return;
+      }
+      handshakeBuffer = Buffer.concat([handshakeBuffer, chunk]);
+      const end = handshakeBuffer.indexOf("\r\n\r\n");
+      if (end === -1) {
+        return;
+      }
+      const head = handshakeBuffer.subarray(0, end).toString("utf8");
+      if (!/^HTTP\/1\.1 101/.test(head) || !head.includes(expectedAccept)) {
+        rejectHandshake(createProtocolError(`Shared Codex app-server rejected the WebSocket upgrade: ${head.split("\r\n")[0]}`));
+        return;
+      }
+      upgraded = true;
+      const rest = handshakeBuffer.subarray(end + 4);
+      resolveHandshake();
+      if (rest.length > 0) {
+        this.parser.push(rest);
+      }
+    });
+    this.exitPromise.then(() => rejectHandshake(this.exitError ?? new Error("codex app-server proxy closed during handshake.")));
+
+    this.proc.stdin.write(request);
+    await handshake;
+
+    await this.request("initialize", {
+      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
+      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
+    });
+    this.notify("initialized", {});
+  }
+
+  sendMessage(message) {
+    const stdin = this.proc?.stdin;
+    if (!stdin) {
+      throw new Error("codex app-server proxy stdin is not available.");
+    }
+    stdin.write(encodeFrame(JSON.stringify(message)));
+  }
+
+  async close() {
+    if (this.closed) {
+      await this.exitPromise;
+      return;
+    }
+    this.closed = true;
+    try {
+      this.proc?.stdin.write(encodeFrame(Buffer.alloc(0), 0x8));
+      this.proc?.stdin.end();
+    } catch {
+      // The proxy may already be gone.
+    }
+    setTimeout(() => {
+      if (this.proc && this.proc.exitCode === null) {
+        this.proc.kill("SIGTERM");
+      }
+    }, 200).unref?.();
+    await this.exitPromise;
+  }
+}
+
 class BrokerCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
@@ -334,6 +492,26 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
+    const mode = options.disableBroker ? "private" : options.appServerMode ?? resolveAppServerMode(options.env ?? process.env);
+    if (mode !== "private") {
+      const env = options.env ?? process.env;
+      const available = isSharedServerRunning(env) || (mode === "shared" && startSharedServer(env));
+      if (available) {
+        try {
+          const shared = new SharedProxyAppServerClient(cwd, options);
+          await shared.initialize();
+          return shared;
+        } catch (error) {
+          if (mode === "shared") {
+            throw error;
+          }
+        }
+      } else if (mode === "shared") {
+        throw new Error(
+          `${APP_SERVER_MODE_ENV}=shared but the shared Codex app-server is not running and could not be started. Run \`codex app-server daemon start\`, or set ${APP_SERVER_MODE_ENV}=private.`
+        );
+      }
+    }
     let brokerEndpoint = null;
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
