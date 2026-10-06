@@ -1,3 +1,4 @@
+// Fork modification (Apache-2.0 §4(b)): persistent review threads, review thread naming.
 /**
  * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
  * @typedef {import("./app-server-protocol").ReviewTarget} ReviewTarget
@@ -1010,7 +1011,7 @@ export async function runAppServerReview(cwd, options = {}) {
     const thread = await startThread(client, cwd, {
       model: options.model,
       sandbox: "read-only",
-      ephemeral: true,
+      ephemeral: false,
       threadName: options.threadName
     });
     const sourceThreadId = thread.thread.id;
@@ -1183,6 +1184,12 @@ export async function findLatestTaskThread(cwd) {
 
 export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
+}
+
+export function buildReviewThreadName(reviewName, targetLabel) {
+  const prefix = `Codex Companion ${reviewName}`;
+  const excerpt = shorten(targetLabel, 56);
+  return excerpt ? `${prefix}: ${excerpt}` : prefix;
 }
 
 export function parseStructuredOutput(rawOutput, fallback = {}) {
