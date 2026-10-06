@@ -1,3 +1,4 @@
+// Fork modification (Apache-2.0 §4(b)): records the app-server transport on jobs.
 import fs from "node:fs";
 import process from "node:process";
 
@@ -16,6 +17,7 @@ function normalizeProgressEvent(value) {
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
+      transport: typeof value.transport === "string" && value.transport.trim() ? value.transport.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
@@ -27,6 +29,7 @@ function normalizeProgressEvent(value) {
     phase: null,
     threadId: null,
     turnId: null,
+    transport: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
     logBody: null
@@ -71,6 +74,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastTransport = null;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -92,6 +96,12 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.turnId && normalized.turnId !== lastTurnId) {
       lastTurnId = normalized.turnId;
       patch.turnId = normalized.turnId;
+      changed = true;
+    }
+
+    if (normalized.transport && normalized.transport !== lastTransport) {
+      lastTransport = normalized.transport;
+      patch.appServerTransport = normalized.transport;
       changed = true;
     }
 
